@@ -9928,6 +9928,13 @@
   proname => 'pg_logical_emit_message', provolatile => 'v', proparallel => 'u',
   prorettype => 'pg_lsn', proargtypes => 'bool text bytea',
   prosrc => 'pg_logical_emit_message_bytea' },
+{ oid => '5160', descr => 'fast refresh for materialized view',
+  proname => 'pg_fast_refresh', procost => '1000',
+  prorows => '1000', provariadic => 'text', proisstrict => 'f',
+  proretset => 't', provolatile => 'v', proparallel => 'u',
+  prorettype => 'record', proargtypes => 'name text bool',
+  proargnames => '{slot_name,mv_name,reset}',
+  prosrc => 'pg_fast_refresh' },
 
 # event triggers
 { oid => '3566', descr => 'list objects dropped by the current command',

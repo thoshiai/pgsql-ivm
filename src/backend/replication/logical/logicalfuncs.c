@@ -48,6 +48,8 @@
 
 #include "storage/fd.h"
 
+#include "catalog/namespace.h"
+
 /* private date for writing out data */
 typedef struct DecodingOutputState
 {
@@ -426,3 +428,272 @@ pg_logical_emit_message_text(PG_FUNCTION_ARGS)
 	/* bytea and text are compatible */
 	return pg_logical_emit_message_bytea(fcinfo);
 }
+
+/*
+ * ivm for logical decoding functions.
+ */
+Datum
+pg_fast_refresh(PG_FUNCTION_ARGS)
+{
+	Name		name;
+	char *mv_name;
+	List *mv_names;
+	bool reset;
+
+	Oid matviewOid;
+	Relation matviewRel;
+	Query *query;
+
+
+	/*temp*/
+	bool binary =false;
+	bool confirm =false;
+
+
+	XLogRecPtr	upto_lsn;
+	int32		upto_nchanges;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	XLogRecPtr	end_of_wal;
+	XLogRecPtr	startptr;
+	LogicalDecodingContext *ctx;
+	ResourceOwner old_resowner = CurrentResourceOwner;
+	ArrayType  *arr;
+	Size		ndim;
+	List	   *options = NIL;
+	DecodingOutputState *p;
+
+	check_permissions();
+
+	CheckLogicalDecodingRequirements();
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("slot name must not be null")));
+	name = PG_GETARG_NAME(0);
+
+	if (PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("matview name must not be null")));
+	mv_name = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	mv_names = stringToQualifiedNameList(mv_name);
+
+	if (PG_ARGISNULL(3))
+		reset = true;
+	else
+		reset = PG_GETARG_BOOL(3);
+
+	/*
+	 * Wait for concurrent transactions which update this materialized view at READ COMMITED.
+	 * This is needed to see changes commited in othre transactions. No wait and raise an error
+	 * at REPEATABLE READ or SERIALIZABLE to prevent anormal update of matviews.
+	 * XXX: dead-lock is possible here.
+	 */
+	if (!IsolationUsesXactSnapshot())
+		matviewOid = RangeVarGetRelid(makeRangeVarFromNameList(mv_names), ExclusiveLock, true);
+	else
+		matviewOid = RangeVarGetRelidExtended(makeRangeVarFromNameList(mv_names), ExclusiveLock, RVR_MISSING_OK | RVR_NOWAIT, NULL, NULL);
+
+	matviewRel = table_open(matviewOid, NoLock);
+	query = get_view_query(matviewRel);
+
+	elog_node_display(LOG, "parse tree", query,
+					  true);
+//					  Debug_pretty_print);
+
+
+	table_close(matviewRel, NoLock);
+
+
+
+	/* state to write output to */
+	p = palloc0(sizeof(DecodingOutputState));
+
+	p->binary_output = binary;
+
+	/* Build a tuple descriptor for our result type */
+	if (get_call_result_type(fcinfo, NULL, &p->tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+
+	/* Deconstruct options array */
+	ndim = ARR_NDIM(arr);
+	if (ndim > 1)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("array must be one-dimensional")));
+	}
+	else if (array_contains_nulls(arr))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("array must not contain nulls")));
+	}
+	else if (ndim == 1)
+	{
+		int			nelems;
+		Datum	   *datum_opts;
+		int			i;
+
+		Assert(ARR_ELEMTYPE(arr) == TEXTOID);
+
+		deconstruct_array(arr, TEXTOID, -1, false, 'i',
+						  &datum_opts, NULL, &nelems);
+
+		if (nelems % 2 != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("array must have even number of elements")));
+
+		for (i = 0; i < nelems; i += 2)
+		{
+			char	   *name = TextDatumGetCString(datum_opts[i]);
+			char	   *opt = TextDatumGetCString(datum_opts[i + 1]);
+
+			options = lappend(options, makeDefElem(name, (Node *) makeString(opt), -1));
+		}
+	}
+
+	p->tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = p->tupstore;
+	rsinfo->setDesc = p->tupdesc;
+
+	/*
+	 * Compute the current end-of-wal and maintain ThisTimeLineID.
+	 * RecoveryInProgress() will update ThisTimeLineID on promotion.
+	 */
+	if (!RecoveryInProgress())
+		end_of_wal = GetFlushRecPtr();
+	else
+		end_of_wal = GetXLogReplayRecPtr(&ThisTimeLineID);
+
+	ReplicationSlotAcquire(NameStr(*name), true);
+
+	PG_TRY();
+	{
+		/* restart at slot's confirmed_flush */
+		ctx = CreateDecodingContext(InvalidXLogRecPtr,
+									options,
+									false,
+									logical_read_local_xlog_page,
+									LogicalOutputPrepareWrite,
+									LogicalOutputWrite, NULL);
+
+		MemoryContextSwitchTo(oldcontext);
+
+		/*
+		 * Check whether the output plugin writes textual output if that's
+		 * what we need.
+		 */
+		if (!binary &&
+			ctx->options.output_type !=OUTPUT_PLUGIN_TEXTUAL_OUTPUT)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("logical decoding output plugin \"%s\" produces binary output, but function \"%s\" expects textual data",
+							NameStr(MyReplicationSlot->data.plugin),
+							format_procedure(fcinfo->flinfo->fn_oid))));
+
+		ctx->output_writer_private = p;
+
+		/*
+		 * Decoding of WAL must start at restart_lsn so that the entirety of
+		 * xacts that committed after the slot's confirmed_flush can be
+		 * accumulated into reorder buffers.
+		 */
+		startptr = MyReplicationSlot->data.restart_lsn;
+
+		/* invalidate non-timetravel entries */
+		InvalidateSystemCaches();
+
+		/* Decode until we run out of records */
+		while ((startptr != InvalidXLogRecPtr && startptr < end_of_wal) ||
+			   (ctx->reader->EndRecPtr != InvalidXLogRecPtr && ctx->reader->EndRecPtr < end_of_wal))
+		{
+			XLogRecord *record;
+			char	   *errm = NULL;
+
+			record = XLogReadRecord(ctx->reader, startptr, &errm);
+			if (errm)
+				elog(ERROR, "%s", errm);
+
+			/*
+			 * Now that we've set up the xlog reader state, subsequent calls
+			 * pass InvalidXLogRecPtr to say "continue from last record"
+			 */
+			startptr = InvalidXLogRecPtr;
+
+			/*
+			 * The {begin_txn,change,commit_txn}_wrapper callbacks above will
+			 * store the description into our tuplestore.
+			 */
+			if (record != NULL)
+				LogicalDecodingProcessRecord(ctx, ctx->reader);
+
+			/* check limits */
+			if (upto_lsn != InvalidXLogRecPtr &&
+				upto_lsn <= ctx->reader->EndRecPtr)
+				break;
+			if (upto_nchanges != 0 &&
+				upto_nchanges <= p->returned_rows)
+				break;
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		tuplestore_donestoring(tupstore);
+
+		/*
+		 * Logical decoding could have clobbered CurrentResourceOwner during
+		 * transaction management, so restore the executor's value.  (This is
+		 * a kluge, but it's not worth cleaning up right now.)
+		 */
+		CurrentResourceOwner = old_resowner;
+
+		/*
+		 * Next time, start where we left off. (Hunting things, the family
+		 * business..)
+		 */
+		if (ctx->reader->EndRecPtr != InvalidXLogRecPtr && confirm)
+		{
+			LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
+
+			/*
+			 * If only the confirmed_flush_lsn has changed the slot won't get
+			 * marked as dirty by the above. Callers on the walsender
+			 * interface are expected to keep track of their own progress and
+			 * don't need it written out. But SQL-interface users cannot
+			 * specify their own start positions and it's harder for them to
+			 * keep track of their progress, so we should make more of an
+			 * effort to save it for them.
+			 *
+			 * Dirty the slot so it's written out at the next checkpoint.
+			 * We'll still lose its position on crash, as documented, but it's
+			 * better than always losing the position even on clean restart.
+			 */
+			ReplicationSlotMarkDirty();
+		}
+
+		/* free context, call shutdown callback */
+		FreeDecodingContext(ctx);
+
+		ReplicationSlotRelease();
+		InvalidateSystemCaches();
+	}
+	PG_CATCH();
+	{
+		/* clear all timetravel entries */
+		InvalidateSystemCaches();
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return (Datum) 0;
+}
+
