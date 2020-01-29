@@ -68,7 +68,8 @@
 #include "catalog/pg_depend.h"
 #include "catalog/pg_trigger.h"
 #include "utils/fmgroids.h"
-
+#include "executor/tstoreReceiver.h"
+#include "utils/tuplestore.h"
 
 typedef struct
 {
@@ -240,8 +241,9 @@ static void calc_delta(MV_TriggerTable *table, List *rte_path, Query *query,
 static Query *rewrite_query_for_postupdate_state(Query *query, MV_TriggerTable *table, List *rte_path);
 static ListCell *getRteListCell(Query *query, List *rte_path);
 
-static void apply_delta(Oid matviewOid, Oid tempOid_new, Oid tempOid_old, Query *query,
-			char *count_colname, IvmMaintenanceGraph *graph);
+static void apply_delta(Oid matviewOid, Tuplestorestate *new_tuplestores,
+						Tuplestorestate *old_tuplestores, Query *query,
+						char *count_colname, IvmMaintenanceGraph *graph);
 static void append_set_clause_for_count(const char *resname, StringInfo buf_old,
 							StringInfo buf_new,StringInfo aggs_list);
 static void append_set_clause_for_sum(const char *resname, StringInfo buf_old,
@@ -276,14 +278,12 @@ static void insert_dangling_tuples(IvmMaintenanceGraph *graph, Query *query,
 					   Relation matviewRel, const char *deltaname_old);
 static void delete_dangling_tuples(IvmMaintenanceGraph *graph, Query *query,
 					   Relation matviewRel, const char *deltaname_new);
-static void truncate_view_delta(Oid delta_oid);
 
 static void mv_InitHashTables(void);
 static SPIPlanPtr mv_FetchPreparedPlan(MV_QueryKey *key);
 static void mv_HashPreparedPlan(MV_QueryKey *key, SPIPlanPtr plan);
 static void mv_BuildQueryKey(MV_QueryKey *key, Oid matview_id, int32 query_type);
 static void clean_up_IVM_hash_entry(MV_TriggerHashEntry *entry);
-static void clean_up_IVM_temptable(Oid tempOid_old, Oid tempOid_new);
 
 
 /*
@@ -1353,10 +1353,9 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	Relation	matviewRel;
 	int old_depth = matview_maintenance_depth;
 
-	Oid			tableSpace;
 	Oid			relowner;
-	Oid			OIDDelta_new = InvalidOid;
-	Oid			OIDDelta_old = InvalidOid;
+	Tuplestorestate *old_tuplestore = NULL;
+	Tuplestorestate *new_tuplestore = NULL;
 	DestReceiver *dest_new = NULL, *dest_old = NULL;
 	Oid			save_userid;
 	int			save_sec_context;
@@ -1461,10 +1460,15 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	if (entry->before_trig_count != entry->after_trig_count)
 		return PointerGetDatum(NULL);
 
-
 	/*
 	 * If this is the last AFTER trigger call, continue and update the view.
 	 */
+
+	/*
+	 * Advance command counter to make the updated base table row locally
+	 * visible.
+	 */
+	CommandCounterIncrement();
 
 	matviewRel = table_open(matviewOid, NoLock);
 
@@ -1533,24 +1537,30 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 	save_nestlevel = NewGUCNestLevel();
 
 	/* Create temporary tables to store view deltas */
-	tableSpace = GetDefaultTablespace(RELPERSISTENCE_TEMP, false);
 	if (entry->has_old)
 	{
-		OIDDelta_old = make_new_heap(matviewOid, tableSpace, RELPERSISTENCE_TEMP,
-									 ExclusiveLock);
-		LockRelationOid(OIDDelta_old, AccessExclusiveLock);
-		dest_old = CreateTransientRelDestReceiver(OIDDelta_old);
+		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+
+		old_tuplestore = tuplestore_begin_heap(false, false, work_mem);
+		dest_old = CreateDestReceiver(DestTuplestore);
+		SetTuplestoreDestReceiverParams(dest_old,
+									old_tuplestore,
+									TopTransactionContext,
+									false);
+
+		MemoryContextSwitchTo(oldcxt);
 	}
 	if (entry->has_new)
 	{
-		if (entry->has_old)
-			OIDDelta_new = make_new_heap(OIDDelta_old, tableSpace, RELPERSISTENCE_TEMP,
-										 ExclusiveLock);
-		else
-			OIDDelta_new = make_new_heap(matviewOid, tableSpace, RELPERSISTENCE_TEMP,
-										 ExclusiveLock);
-		LockRelationOid(OIDDelta_new, AccessExclusiveLock);
-		dest_new = CreateTransientRelDestReceiver(OIDDelta_new);
+		oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+
+		new_tuplestore = tuplestore_begin_heap(false, false, work_mem);
+		dest_new = CreateDestReceiver(DestTuplestore);
+		SetTuplestoreDestReceiverParams(dest_new,
+									new_tuplestore,
+									TopTransactionContext,
+									false);
+		MemoryContextSwitchTo(oldcxt);
 	}
 
 	/*
@@ -1620,7 +1630,7 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 			PG_TRY();
 			{
 				/* apply the delta tables to the materialized view */
-				apply_delta(matviewOid, OIDDelta_new, OIDDelta_old, query, count_colname,
+				apply_delta(matviewOid, new_tuplestore, old_tuplestore, query, count_colname,
 					hasOuterJoins ? maintenance_graph : NULL);
 			}
 			PG_CATCH();
@@ -1631,14 +1641,25 @@ IVM_immediate_maintenance(PG_FUNCTION_ARGS)
 			PG_END_TRY();
 
 			/* truncate view delta tables */
-			truncate_view_delta(OIDDelta_old);
-			truncate_view_delta(OIDDelta_new);
+			if (old_tuplestore)	
+				tuplestore_clear(old_tuplestore);
+			if (new_tuplestore)	
+				tuplestore_clear(new_tuplestore);
 		}
 	}
 
 	/* Clean up hash entry and drop temporary tables */
 	clean_up_IVM_hash_entry(entry);
-	clean_up_IVM_temptable(OIDDelta_old, OIDDelta_new);
+	if (old_tuplestore)
+	{
+		dest_old->rDestroy(dest_old);
+		tuplestore_end(old_tuplestore);
+	}
+	if (new_tuplestore)
+	{
+		dest_new->rDestroy(dest_new);
+		tuplestore_end(new_tuplestore);
+	}
 
 	/* Pop the original snapshot. */
 	PopActiveSnapshot();
@@ -2819,22 +2840,21 @@ getRteListCell(Query *query, List *rte_path)
  * the view maintenance graph.
  */
 static void
-apply_delta(Oid matviewOid, Oid tempOid_new, Oid tempOid_old, Query *query,
-			char *count_colname, IvmMaintenanceGraph *graph)
+apply_delta(Oid matviewOid, Tuplestorestate *new_tuplestores, Tuplestorestate *old_tuplestores,
+			Query *query, char *count_colname, IvmMaintenanceGraph *graph)
 {
 	StringInfoData querybuf;
 	StringInfo	aggs_list_buf = NULL;
 	StringInfo	aggs_set_old = NULL;
 	StringInfo	aggs_set_new = NULL;
 	Relation	matviewRel;
-	Relation	tempRel_new = NULL, tempRel_old = NULL;
 	char	   *matviewname;
-	char	   *tempname_new = NULL, *tempname_old = NULL;
 	ListCell	*lc;
 	int			i;
 	List	   *keys = NIL;
 	List	   *minmax_list = NIL;
 	List	   *is_min_list = NIL;
+	int rc;
 
 
 	/*
@@ -2844,17 +2864,42 @@ apply_delta(Oid matviewOid, Oid tempOid_new, Oid tempOid_old, Query *query,
 	matviewRel = table_open(matviewOid, NoLock);
 	matviewname = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(matviewRel)),
 											 RelationGetRelationName(matviewRel));
-	if (OidIsValid(tempOid_new))
+	/* Open SPI context. */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+
+	if (new_tuplestores && tuplestore_tuple_count(new_tuplestores) > 0)
 	{
-		tempRel_new = table_open(tempOid_new, NoLock);
-		tempname_new = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(tempRel_new)),
-												  RelationGetRelationName(tempRel_new));
+			EphemeralNamedRelation enr =
+				palloc(sizeof(EphemeralNamedRelationData));
+
+			enr->md.name = pstrdup("new_delta");
+			enr->md.reliddesc = matviewOid;
+			enr->md.tupdesc = NULL;
+			enr->md.enrtype = ENR_NAMED_TUPLESTORE;
+			enr->md.enrtuples = tuplestore_tuple_count(new_tuplestores);
+			enr->reldata = new_tuplestores;
+
+			rc = SPI_register_relation(enr);
+			if (rc != SPI_OK_REL_REGISTER)
+				elog(ERROR, "SPI_register failed");
 	}
-	if (OidIsValid(tempOid_old))
+	if (old_tuplestores && tuplestore_tuple_count(old_tuplestores) > 0)
 	{
-		tempRel_old = table_open(tempOid_old, NoLock);
-		tempname_old = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(tempRel_old)),
-												  RelationGetRelationName(tempRel_old));
+
+			EphemeralNamedRelation enr =
+				palloc(sizeof(EphemeralNamedRelationData));
+
+			enr->md.name = pstrdup("old_delta");
+			enr->md.reliddesc = matviewOid;
+			enr->md.tupdesc = NULL;
+			enr->md.enrtype = ENR_NAMED_TUPLESTORE;
+			enr->md.enrtuples = tuplestore_tuple_count(old_tuplestores);
+			enr->reldata = old_tuplestores;
+
+			rc = SPI_register_relation(enr);
+			if (rc != SPI_OK_REL_REGISTER)
+				elog(ERROR, "SPI_register failed");
 	}
 
 	/*
@@ -2865,9 +2910,9 @@ apply_delta(Oid matviewOid, Oid tempOid_new, Oid tempOid_old, Query *query,
 
 	if (query->hasAggs)
 	{
-		if (OidIsValid(tempOid_old))
+		if (old_tuplestores && tuplestore_tuple_count(old_tuplestores) > 0)
 			aggs_set_old = makeStringInfo();
-		if (OidIsValid(tempOid_new))
+		if (new_tuplestores && tuplestore_tuple_count(new_tuplestores) > 0)
 			aggs_set_new = makeStringInfo();
 		aggs_list_buf = makeStringInfo();
 	}
@@ -2946,33 +2991,13 @@ apply_delta(Oid matviewOid, Oid tempOid_new, Oid tempOid_old, Query *query,
 		}
 	}
 
-
-	/* Open SPI context. */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
-
-	/* Analyze the temp table with the new contents. */
-	if (tempname_new)
-	{
-		appendStringInfo(&querybuf, "ANALYZE %s", tempname_new);
-		if (SPI_exec(querybuf.data, 0) != SPI_OK_UTILITY)
-			elog(ERROR, "SPI_exec failed: %s", querybuf.data);
-	}
-	if (tempname_old)
-	{
-		resetStringInfo(&querybuf);
-		appendStringInfo(&querybuf, "ANALYZE %s", tempname_old);
-		if (SPI_exec(querybuf.data, 0) != SPI_OK_UTILITY)
-			elog(ERROR, "SPI_exec failed: %s", querybuf.data);
-	}
-
 	/* Start maintaining the materialized view. */
 	OpenMatViewIncrementalMaintenance();
 
 	/* For tuple deletion */
-	if (tempname_old)
+	if (old_tuplestores && tuplestore_tuple_count(old_tuplestores) > 0)
 	{
-		char *qry = build_query_for_apply_old_delta(matviewname, tempname_old,
+		char *qry = build_query_for_apply_old_delta(matviewname, "old_delta",
 													keys, aggs_list_buf, aggs_set_old,
 													minmax_list, is_min_list,
 													count_colname);
@@ -2988,29 +3013,25 @@ apply_delta(Oid matviewOid, Oid tempOid_new, Oid tempOid_old, Query *query,
 
 		/* Insert dangling tuple for outer join views */
 		if (graph && !query->hasAggs)
-			insert_dangling_tuples(graph, query, matviewRel, tempname_old);
+			insert_dangling_tuples(graph, query, matviewRel, "old_delta");
 
 	}
 	/* For tuple insertion */
-	if (tempname_new)
+	if (new_tuplestores && tuplestore_tuple_count(new_tuplestores) > 0)
 	{
-		char *qry = build_query_for_apply_new_delta(matviewname, tempname_new,
+		char *qry = build_query_for_apply_new_delta(matviewname, "new_delta",
 													keys, aggs_set_new, count_colname);
 		if (SPI_exec(qry, 0) != SPI_OK_INSERT)
 			elog(ERROR, "SPI_exec failed: %s", qry);
 
 		/* Delete dangling tuple for outer join views */
 		if (graph && !query->hasAggs)
-			delete_dangling_tuples(graph, query, matviewRel, tempname_new);
+			delete_dangling_tuples(graph, query, matviewRel, "new_delta");
 	}
 
 	/* We're done maintaining the materialized view. */
 	CloseMatViewIncrementalMaintenance();
 
-	if (OidIsValid(tempOid_new))
-		table_close(tempRel_new, NoLock);
-	if (OidIsValid(tempOid_old))
-		table_close(tempRel_old, NoLock);
 
 	table_close(matviewRel, NoLock);
 
@@ -4066,26 +4087,6 @@ delete_dangling_tuples(IvmMaintenanceGraph *graph, Query *query,
 }
 
 /*
- * truncate_view_delta
- *
- * Truncate temptables for storing delta.
- */
-static void
-truncate_view_delta(Oid delta_oid)
-{
-	Relation	rel;
-
-	if (!OidIsValid(delta_oid))
-		return;
-
-	rel = table_open(delta_oid, NoLock);
-	ExecuteTruncateGuts(list_make1(rel), list_make1_oid(delta_oid), NIL,
-						DROP_RESTRICT, false);
-	table_close(rel, NoLock);
-}
-
-
-/*
  * mv_InitHashTables
  */
 static void
@@ -4243,63 +4244,6 @@ clean_up_IVM_hash_entry(MV_TriggerHashEntry *entry)
 	list_free(entry->tables);
 
 	hash_search(mv_trigger_info, (void *) &entry->matview_id, HASH_REMOVE, &found);
-}
-
-/*
- * clean_up_IVM_temptable
- *
- * Drop temptables for storing deltas.
- */
-static void
-clean_up_IVM_temptable(Oid tempOid_old, Oid tempOid_new)
-{
-	Relation tempRel_old;
-	Relation tempRel_new;
-	char *tempname_old = NULL;
-	char *tempname_new = NULL;
-	StringInfoData querybuf;
-
-	/* get names of temptables */
-	if (OidIsValid(tempOid_new))
-	{
-		tempRel_new = table_open(tempOid_new, NoLock);
-		tempname_new = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(tempRel_new)),
-												  RelationGetRelationName(tempRel_new));
-		table_close(tempRel_new, NoLock);
-	}
-	if (OidIsValid(tempOid_old))
-	{
-		tempRel_old = table_open(tempOid_old, NoLock);
-		tempname_old = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(tempRel_old)),
-												  RelationGetRelationName(tempRel_old));
-		table_close(tempRel_old, NoLock);
-	}
-
-	initStringInfo(&querybuf);
-
-	/* Open SPI context. */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
-
-	/* Clean up temp tables. */
-	if (OidIsValid(tempOid_old))
-	{
-		resetStringInfo(&querybuf);
-		appendStringInfo(&querybuf, "DROP TABLE %s", tempname_old);
-		if (SPI_exec(querybuf.data, 0) != SPI_OK_UTILITY)
-			elog(ERROR, "SPI_exec failed: %s", querybuf.data);
-	}
-	if (OidIsValid(tempOid_new))
-	{
-		resetStringInfo(&querybuf);
-		appendStringInfo(&querybuf, "DROP TABLE %s", tempname_new);
-		if (SPI_exec(querybuf.data, 0) != SPI_OK_UTILITY)
-			elog(ERROR, "SPI_exec failed: %s", querybuf.data);
-	}
-
-	/* Close SPI context. */
-	if (SPI_finish() != SPI_OK_FINISH)
-		elog(ERROR, "SPI_finish failed");
 }
 
 /*
