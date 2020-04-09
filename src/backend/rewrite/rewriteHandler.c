@@ -25,12 +25,14 @@
 #include "access/table.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_type.h"
+#include "commands/matview.h"
 #include "commands/trigger.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/analyze.h"
+#include "parser/parser.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
@@ -41,10 +43,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/guc.h"
 
-#include "parser/parser.h"
-#include "commands/matview.h"
 
 /* We use a list of these to detect recursion in RewriteQuery */
 typedef struct rewrite_event
