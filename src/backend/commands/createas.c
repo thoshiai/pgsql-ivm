@@ -433,10 +433,11 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 			 */
 			SetMatViewIVMState(matviewRel, true);
 
-			if (!into->skipData)
+			CreateIvmTriggersOnBaseTables(query, (Node *)query->jointree, matviewOid, &relids);
+			bms_free(relids);
+			if (into->skipData)
 			{
-				CreateIvmTriggersOnBaseTables(query, (Node *)query->jointree, matviewOid, &relids);
-				bms_free(relids);
+				DisableTrigger();
 			}
 			table_close(matviewRel, NoLock);
 		}

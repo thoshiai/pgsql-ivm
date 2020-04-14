@@ -4420,3 +4420,13 @@ get_securityQuals(Oid relId, int rt_index, Query *query)
 
 	return securityQuals;
 }
+
+/*
+ * EnableDisableIvmTrigger
+ *
+ * should disable IVM trigger if WITH NO DATA is fa true
+ */
+void
+EnableDisableIvmTrigger()
+{
+}
