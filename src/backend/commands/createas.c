@@ -222,6 +222,14 @@ create_ctas_nodata(List *tlist, IntoClause *into)
 								exprTypmod((Node *) tle->expr),
 								exprCollation((Node *) tle->expr));
 
+/*
+			if (strcmp(colname, "__ivm_test__"))
+			{
+				col->generated = ATTRIBUTE_GENERATED_STORED;
+				col->raw_default = ;
+			}
+*/
+
 			/*
 			 * It's possible that the column is of a collatable type but the
 			 * collation could not be resolved, so double-check.  (We must
@@ -777,6 +785,38 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 							attribute->atttypid,
 							attribute->atttypmod,
 							attribute->attcollation);
+
+		/*
+		 * Temporary alternative process 
+		 * We need the following processes:
+		 * 1. convert OpExpr to A_Expr
+		 * 2. mark generated column in immv
+		 * 3. add a judgment of generated column in diff calculation
+		 *    and application process
+		 */
+		if (strcmp(colname, "__test_ivm__") == 0)
+		{
+			Query *query = into->viewQuery;
+			TargetEntry *tle = list_nth(query->targetList, attnum);
+			if (tle)
+			{
+				A_Expr	   *e;
+				A_Const *c;
+				OpExpr *op = tle->expr;
+				c = makeNode(A_Const);
+				c->val.type = T_Integer;
+				c->val.val.ival = DatumGetInt32(((Const *) list_nth(op->args,1))->constvalue);;
+				c->location = -1;
+//				col->raw_default = tle->expr;
+				e = makeSimpleA_Expr(AEXPR_OP, "+",
+						(Node *) copyObject(list_nth(op->args, 0)),
+						(Node *) copyObject(c), -1);
+//						(Node *) copyObject(list_nth(op->args,1)), -1);
+				/* set generate column flag */
+				col->raw_default = e;
+				col->generated = ATTRIBUTE_GENERATED_STORED;
+			}
+		}
 
 		/*
 		 * It's possible that the column is of a collatable type but the

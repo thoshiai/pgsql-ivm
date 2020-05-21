@@ -2962,6 +2962,8 @@ apply_delta(Oid matviewOid, Tuplestorestate *old_tuplestores, Tuplestorestate *n
 		Form_pg_attribute attr = TupleDescAttr(matviewRel->rd_att, i);
 		char   *resname = NameStr(attr->attname);
 
+		if (strcmp(resname,"__test_ivm__") == 0)
+			continue;
 		if (i != 0)
 			appendStringInfo(&target_list_buf, ", ");
 		appendStringInfo(&target_list_buf, "%s", quote_qualified_identifier(NULL, resname));
