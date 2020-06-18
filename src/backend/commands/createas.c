@@ -744,6 +744,7 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 {
 	DR_intorel *myState = (DR_intorel *) self;
 	IntoClause *into = myState->into;
+	Query *query = into->viewQuery;
 	bool		is_matview;
 	char		relkind;
 	List	   *attrList;
@@ -770,6 +771,7 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	for (attnum = 0; attnum < typeinfo->natts; attnum++)
 	{
 		Form_pg_attribute attribute = TupleDescAttr(typeinfo, attnum);
+		TargetEntry *tle = list_nth(query->targetList, attnum);
 		ColumnDef  *col;
 		char	   *colname;
 
@@ -785,6 +787,7 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 							attribute->atttypid,
 							attribute->atttypmod,
 							attribute->attcollation);
+//	dataQuery = get_matview_query(matviewRel);
 
 		/*
 		 * Temporary alternative process 
@@ -794,28 +797,47 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 		 * 3. add a judgment of generated column in diff calculation
 		 *    and application process
 		 */
-		if (strcmp(colname, "__test_ivm__") == 0)
+//		if (strcmp(colname, "__test_ivm__") == 0)
+		if (tle && !IsA(tle->expr, Aggref) && contain_aggs_of_level((Node *) tle->expr, 0))
 		{
-			Query *query = into->viewQuery;
-			TargetEntry *tle = list_nth(query->targetList, attnum);
-			if (tle)
-			{
-				A_Expr	   *e;
-				A_Const *c;
-				OpExpr *op = tle->expr;
-				c = makeNode(A_Const);
-				c->val.type = T_Integer;
-				c->val.val.ival = DatumGetInt32(((Const *) list_nth(op->args,1))->constvalue);;
-				c->location = -1;
-//				col->raw_default = tle->expr;
-				e = makeSimpleA_Expr(AEXPR_OP, "+",
-						(Node *) copyObject(list_nth(op->args, 0)),
-						(Node *) copyObject(c), -1);
-//						(Node *) copyObject(list_nth(op->args,1)), -1);
-				/* set generate column flag */
-				col->raw_default = e;
-				col->generated = ATTRIBUTE_GENERATED_STORED;
-			}
+/*
+			A_Expr *e;
+			List *raw_parsetree_list;
+
+			e = transformOpAExpr(tle->expr);
+			raw_parsetree_list = pg_parse_query(src);
+*/
+
+/*
+			Aggref *agg;
+			ColumnRef *cref;
+			FuncCall *fn;
+			A_Expr  *e;
+			A_Const *c;
+			OpExpr *op = tle->expr;
+
+			agg = list_nth(op->args, 0);
+			cref = makeNode(ColumnRef);
+			cref->fields = list_make1(makeString("sum_id"));
+			cref->location = 0;
+
+			c = makeNode(A_Const);
+			c->val.type = T_Integer;
+			c->val.val.ival = DatumGetInt32(((Const *) list_nth(op->args,1))->constvalue);;
+			c->location = -1;
+//			col->raw_default = tle->expr;
+			e = makeSimpleA_Expr(AEXPR_OP, "+",
+					(Node *) copyObject(cref),
+					(Node *) copyObject(c), -1);
+//					(Node *) copyObject(fn),
+//					(Node *) copyObject(list_nth(op->args, 0)),
+//					(Node *) copyObject(list_nth(op->args,1)), -1);
+*/
+			/* set generate column flag */
+//			col->raw_default = e;
+			col->raw_default = NULL;
+			col->generated = ATTRIBUTE_GENERATED_STORED;
+			col->cooked_default = tle->expr;
 		}
 
 		/*
@@ -1159,10 +1181,12 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *ctx, int
 							ereport(ERROR,
 									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 									 errmsg("column name %s is not supported on incrementally maintainable materialized view", tle->resname)));
+/*
 					if (ctx->has_agg && !IsA(tle->expr, Aggref) && contain_aggs_of_level((Node *) tle->expr, 0))
 						ereport(ERROR,
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 								 errmsg("expression containing an aggregate in it is not supported on incrementally maintainable materialized view")));
+*/
 					check_ivm_restriction_walker((Node *) tle->expr, ctx, depth);
 				}
 
@@ -1507,3 +1531,70 @@ check_aggregate_supports_ivm(Oid aggfnoid)
 			return false;
 	}
 }
+
+/*
+ *
+ */
+static Node *
+transformOpAExpr(OpExpr *op)
+{
+//	Node	   *lexpr = op->lexpr;
+//	Node	   *rexpr = op->rexpr;
+
+//	List *parsetree_list;
+
+/*
+			Aggref *agg;
+			ColumnRef *cref;
+			FuncCall *fn;
+			A_Expr  *e;
+			A_Const *c;
+			OpExpr *op = tle->expr;
+
+// 			parsetree_list = pg_parse_query(query_string);
+///	linitial(aaa);
+		agg = list_nth(op->args, 0);
+			cref = makeNode(ColumnRef);
+			cref->fields = list_make1(makeString("sum_id"));
+			cref->location = 0;
+
+			c = makeNode(A_Const);
+			c->val.type = T_Integer;
+			c->val.val.ival = DatumGetInt32(((Const *) list_nth(op->args,1))->constvalue);;
+			c->location = -1;
+//			col->raw_default = tle->expr;
+			e = makeSimpleA_Expr(AEXPR_OP, "+",
+					(Node *) copyObject(cref),
+					(Node *) copyObject(c), -1);
+//					(Node *) copyObject(fn),
+//					(Node *) copyObject(list_nth(op->args, 0)),
+//					(Node *) copyObject(list_nth(op->args,1)), -1);
+*/
+//			/* set generate column flag */
+//			col->raw_default = e;
+//			col->generated = ATTRIBUTE_GENERATED_STORED;
+
+//		}
+}
+
+
+/*
+ * AddRelationNewConstraints  # backend/catalog/heap.c
+ */
+/*
+static Node *
+AddGeneratedColumn(OpExpr *op)
+{
+	Relation rel;
+	List *list;
+
+	Node	   *lexpr = a->lexpr;
+	Node	   *rexpr = a->rexpr;
+
+	List *parsetree_list;
+
+	AddRelationNewConstraints(rel, list_make1(rawEnt), NIL,
+							  false, true, false, NULL);
+}
+
+*/
