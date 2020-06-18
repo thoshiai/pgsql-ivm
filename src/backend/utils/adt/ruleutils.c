@@ -11418,3 +11418,20 @@ get_range_partbound_string(List *bound_datums)
 
 	return buf->data;
 }
+
+/*
+ *
+ */
+char *
+make_base_query_string(Query *query, TupleDesc resultDesc)
+{
+	StringInfo	buf;
+
+	initStringInfo(&buf);
+
+//	make_viewdef(&buf, ruletup, rulettc, prettyFlags, wrapColumn);
+	get_query_def(query, &buf, NIL, resultDesc, PRETTYFLAG_INDENT, WRAP_COLUMN_DEFAULT, 0);
+	appendStringInfoChar(buf, ';');
+
+	return buf->data;
+}

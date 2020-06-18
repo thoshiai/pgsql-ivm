@@ -41,4 +41,5 @@ extern char *generate_collation_name(Oid collid);
 extern char *generate_opclass_name(Oid opclass);
 extern char *get_range_partbound_string(List *bound_datums);
 
+extern char *make_base_query_string(Query *query, TupleDesc resultDesc);
 #endif							/* RULEUTILS_H */

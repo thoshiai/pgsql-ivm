@@ -753,6 +753,7 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	RangeTblEntry *rte;
 	ListCell   *lc;
 	int			attnum;
+	RawStmt *raw_statement;
 
 	Assert(into != NULL);		/* else somebody forgot to set it */
 
@@ -768,6 +769,14 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	 */
 	attrList = NIL;
 	lc = list_head(into->colNames);
+	if (into->ivm)
+	{
+		char * define_query;
+		List *raw_parsetree_list;
+		define_query = get_make_base_query_string(query, typeinfo);
+		raw_parsetree_list = pg_parse_query(define_query);
+		raw_statement = linitial(raw_parsetree_list);
+	}
 	for (attnum = 0; attnum < typeinfo->natts; attnum++)
 	{
 		Form_pg_attribute attribute = TupleDescAttr(typeinfo, attnum);
@@ -788,6 +797,7 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 							attribute->atttypmod,
 							attribute->attcollation);
 //	dataQuery = get_matview_query(matviewRel);
+//		define_query = get_make_base_query_string(query, typeinfo);
 
 		/*
 		 * Temporary alternative process 
