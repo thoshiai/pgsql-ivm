@@ -2905,7 +2905,21 @@ getRteListCell(Query *query, List *rte_path)
 	return rte_lc;
 }
 
-#define IVM_colname(type, col) makeObjectName("__ivm_" type, col, "_")
+char *
+IVM_colname(const char *type, const char *col)
+{
+	char pre[NAMEDATALEN];
+	snprintf(pre, sizeof(pre), "__ivm_%s", type);
+	if (isIvmColumn(col))
+	{
+		char resname[NAMEDATALEN];
+		strncpy(resname, col + 6, strlen(col)-8);
+		resname[strlen(col) - 8] = '\0';
+		return makeObjectName(pre, resname, "_");
+	}
+	else 
+		return makeObjectName(pre, col, "_");
+}
 
 /*
  * apply_delta

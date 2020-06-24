@@ -104,7 +104,7 @@ static void check_ivm_restriction_walker(Node *node, check_ivm_restriction_conte
 static bool is_equijoin_condition(OpExpr *op);
 static bool check_aggregate_supports_ivm(Oid aggfnoid);
 
-static void makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *pstate, List **agg_counts);
+static void makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *pstate, List **agg_counts, int depth);
 
 /*
  * create_ctas_internal
@@ -557,7 +557,7 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 			char *resname = (colNames == NIL ? tle->resname : strVal(list_nth(colNames, tle->resno-1)));
 //			AttrNumber next_resno;
 
-			makeIvmAggColumn(tle->expr, resname, &next_resno, pstate, &agg_counts);
+			makeIvmAggColumn(tle->expr, resname, &next_resno, pstate, &agg_counts, 0);
 
 /*
 			if (IsA(tle->expr, Aggref))
@@ -645,7 +645,7 @@ rewriteQueryForIMMV(Query *query, List *colNames)
  * makeIvmAggColumn -- make aggregation column which is added by ivm
  */
 static void
-makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *pstate, List **agg_counts)
+makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *pstate, List **agg_counts, int depth)
 {
 	TargetEntry *tle_count;
 
@@ -665,6 +665,17 @@ makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *p
 		Aggref *aggref = (Aggref *) tle;
 		const char *aggname = get_func_name(aggref->aggfnoid);
 
+		if (depth > 0)
+		{
+			resname = pstrdup(IVM_colname(aggname, resname));
+			tle_count = makeTargetEntry((Expr *) tle,
+										*next_resno,
+										resname,
+										false);
+			*agg_counts = lappend(*agg_counts, tle_count);
+			(*next_resno)++;
+		}
+
 		/*
 		 * For aggregate functions except to count, add count func with the same arg parameters.
 		 * Also, add sum func for agv.
@@ -682,7 +693,7 @@ makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *p
 
 			tle_count = makeTargetEntry((Expr *) node,
 										*next_resno,
-										pstrdup(makeObjectName("__ivm_count",resname, "_")),
+										pstrdup(IVM_colname("count", resname)),
 										false);
 			*agg_counts = lappend(*agg_counts, tle_count);
 			(*next_resno)++;
@@ -715,7 +726,7 @@ makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *p
 
 			tle_count = makeTargetEntry((Expr *) node,
 										*next_resno,
-										pstrdup(makeObjectName("__ivm_sum",resname, "_")),
+										pstrdup(IVM_colname("sum", resname)),
 										false);
 			*agg_counts = lappend(*agg_counts, tle_count);
 			(*next_resno)++;
@@ -733,7 +744,7 @@ makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *p
 					foreach(lc, op->args)
 					{
 						Node	   *arg = (Node *) lfirst(lc);
-						makeIvmAggColumn(arg, resname, next_resno, pstate, agg_counts);
+						makeIvmAggColumn(arg, pstrdup(resname), next_resno, pstate, agg_counts, depth + 1);
 					}
 					break;
 				}
@@ -745,8 +756,6 @@ makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *p
 					break;
 		}
 	}
-	
-	return tle_count;
 }
 
 
@@ -879,7 +888,8 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	 */
 	attrList = NIL;
 	lc = list_head(into->colNames);
-	if (into->ivm)
+//	if (into->ivm)
+	if (0)
 	{
 		char * define_query;
 		List *raw_parsetree_list;
