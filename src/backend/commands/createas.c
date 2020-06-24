@@ -104,6 +104,8 @@ static void check_ivm_restriction_walker(Node *node, check_ivm_restriction_conte
 static bool is_equijoin_condition(OpExpr *op);
 static bool check_aggregate_supports_ivm(Oid aggfnoid);
 
+static void makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *pstate, List **agg_counts);
+
 /*
  * create_ctas_internal
  *
@@ -360,6 +362,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 	}
 	else
 	{
+		into->viewQuery = copyObject(query);
 		/*
 		 * Parse analysis was done already, but we still have to run the rule
 		 * rewriter.  We do not do AcquireRewriteLocks: we assume the query
@@ -552,25 +555,21 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 			TargetEntry *tle = (TargetEntry *) lfirst(lc);
 			TargetEntry *tle_count;
 			char *resname = (colNames == NIL ? tle->resname : strVal(list_nth(colNames, tle->resno-1)));
+//			AttrNumber next_resno;
 
+			makeIvmAggColumn(tle->expr, resname, &next_resno, pstate, &agg_counts);
 
+/*
 			if (IsA(tle->expr, Aggref))
 			{
 				Aggref *aggref = (Aggref *) tle->expr;
 				const char *aggname = get_func_name(aggref->aggfnoid);
 
-				/*
-				 * For aggregate functions except to count, add count func with the same arg parameters.
-				 * Also, add sum func for agv.
-				 *
-				 * XXX: If there are same expressions explicitly in the target list, we can use this instead
-				 * of adding new duplicated one.
-				 */
 				if (strcmp(aggname, "count") != 0)
 				{
 					fn = makeFuncCall(list_make1(makeString("count")), NIL, -1);
 
-					/* Make a Func with a dummy arg, and then override this by the original agg's args. */
+					// Make a Func with a dummy arg, and then override this by the original agg's args
 					node = ParseFuncOrColumn(pstate, fn->funcname, list_make1(dmy_arg), NULL, fn, false, -1);
 					((Aggref *)node)->args = aggref->args;
 
@@ -603,7 +602,7 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 					}
 					fn = makeFuncCall(list_make1(makeString("sum")), NIL, -1);
 
-					/* Make a Func with a dummy arg, and then override this by the original agg's args. */
+					// Make a Func with a dummy arg, and then override this by the original agg's args.
 					node = ParseFuncOrColumn(pstate, fn->funcname, dmy_args, NULL, fn, false, -1);
 					((Aggref *)node)->args = aggref->args;
 
@@ -616,6 +615,7 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 				}
 
 			}
+*/
 		}
 		rewritten->targetList = list_concat(rewritten->targetList, agg_counts);
 
@@ -639,6 +639,116 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 
 	return rewritten;
 }
+
+
+/*
+ * makeIvmAggColumn -- make aggregation column which is added by ivm
+ */
+static void
+makeIvmAggColumn(Node *tle, char *resname, AttrNumber *next_resno, ParseState *pstate, List **agg_counts)
+{
+	TargetEntry *tle_count;
+
+
+	if (IsA(tle, Aggref))
+	{
+		Node *node;
+		FuncCall *fn;
+		ListCell *lc;
+		Const	*dmy_arg = makeConst(INT4OID,
+									 -1,
+									 InvalidOid,
+									 sizeof(int32),
+									 Int32GetDatum(1),
+									 false,
+									 true); /* pass by value */
+		Aggref *aggref = (Aggref *) tle;
+		const char *aggname = get_func_name(aggref->aggfnoid);
+
+		/*
+		 * For aggregate functions except to count, add count func with the same arg parameters.
+		 * Also, add sum func for agv.
+		 *
+		 * XXX: If there are same expressions explicitly in the target list, we can use this instead
+		 * of adding new duplicated one.
+		 */
+		if (strcmp(aggname, "count") != 0)
+		{
+			fn = makeFuncCall(list_make1(makeString("count")), NIL, -1);
+
+			/* Make a Func with a dummy arg, and then override this by the original agg's args. */
+			node = ParseFuncOrColumn(pstate, fn->funcname, list_make1(dmy_arg), NULL, fn, false, -1);
+			((Aggref *)node)->args = aggref->args;
+
+			tle_count = makeTargetEntry((Expr *) node,
+										*next_resno,
+										pstrdup(makeObjectName("__ivm_count",resname, "_")),
+										false);
+			*agg_counts = lappend(*agg_counts, tle_count);
+			(*next_resno)++;
+		}
+		if (strcmp(aggname, "avg") == 0)
+		{
+			List *dmy_args = NIL;
+			ListCell *lc;
+			foreach(lc, aggref->aggargtypes)
+			{
+				Oid		typeid = lfirst_oid(lc);
+				Type	type = typeidType(typeid);
+
+				Const *con = makeConst(typeid,
+									   -1,
+									   typeTypeCollation(type),
+									   typeLen(type),
+									   (Datum) 0,
+									   true,
+									   typeByVal(type));
+				dmy_args = lappend(dmy_args, con);
+				ReleaseSysCache(type);
+
+			}
+			fn = makeFuncCall(list_make1(makeString("sum")), NIL, -1);
+
+			/* Make a Func with a dummy arg, and then override this by the original agg's args. */
+			node = ParseFuncOrColumn(pstate, fn->funcname, dmy_args, NULL, fn, false, -1);
+			((Aggref *)node)->args = aggref->args;
+
+			tle_count = makeTargetEntry((Expr *) node,
+										*next_resno,
+										pstrdup(makeObjectName("__ivm_sum",resname, "_")),
+										false);
+			*agg_counts = lappend(*agg_counts, tle_count);
+			(*next_resno)++;
+		}
+	}
+	/* if expression containing an aggregate, this function works as recursive processing */
+	else if (contain_aggs_of_level(tle, 0))
+	{
+		switch (nodeTag(tle))
+		{
+			case T_OpExpr:
+				{
+					OpExpr	   *op = (OpExpr *) tle;
+					ListCell   *lc;
+					foreach(lc, op->args)
+					{
+						Node	   *arg = (Node *) lfirst(lc);
+						makeIvmAggColumn(arg, resname, next_resno, pstate, agg_counts);
+					}
+					break;
+				}
+			case T_SubLink:
+			case T_CaseExpr:
+				/* Currently, another case is not supported */
+				break;
+			default:
+					break;
+		}
+	}
+	
+	return tle_count;
+}
+
 
 /*
  * CreateIvmTriggersOnBaseTables -- create IVM triggers on all base tables
@@ -773,9 +883,12 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	{
 		char * define_query;
 		List *raw_parsetree_list;
-		define_query = get_make_base_query_string(query, typeinfo);
+		define_query = make_base_query_string(query, typeinfo);
 		raw_parsetree_list = pg_parse_query(define_query);
 		raw_statement = linitial(raw_parsetree_list);
+		/* Debug print*/
+		elog_node_display(LOG, "parse tree", raw_statement,
+						  Debug_pretty_print);
 	}
 	for (attnum = 0; attnum < typeinfo->natts; attnum++)
 	{
@@ -808,7 +921,8 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 		 *    and application process
 		 */
 //		if (strcmp(colname, "__test_ivm__") == 0)
-		if (tle && !IsA(tle->expr, Aggref) && contain_aggs_of_level((Node *) tle->expr, 0))
+		if (0 && tle && !IsA(tle->expr, Aggref) && contain_aggs_of_level((Node *) tle->expr, 0))
+//		if (tle && !IsA(tle->expr, Aggref) && contain_aggs_of_level((Node *) tle->expr, 0))
 		{
 /*
 			A_Expr *e;
